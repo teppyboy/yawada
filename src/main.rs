@@ -25,7 +25,7 @@ static CLIENT: LazyLock<Client> = LazyLock::new(|| {
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([640.0, 560.0]),
+        viewport: egui::ViewportBuilder::default().with_inner_size([720.0, 560.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -48,16 +48,24 @@ struct HostsSource {
     enabled: bool,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+struct RedirectedHost {
+    host: String,
+    ip: String,
+    enabled: bool,
+}
+
 struct MyApp {
     blocked_hosts: Vec<String>,
     allowed_hosts: Vec<AllowedHost>,
-    redirected_hosts: Vec<String>,
+    redirected_hosts: Vec<RedirectedHost>,
     is_hosts_file_installed: bool,
     hosts_sources: Vec<HostsSource>,
     hosts_sources_last_updated: u64,
     // UI parts
     show_edit_sources: bool,
     show_edit_allowed_hosts: bool,
+    show_edit_redirect_hosts: bool,
     show_confirmation_dialog: bool,
     allowed_to_close: bool,
     // HACK
@@ -78,6 +86,7 @@ impl Default for MyApp {
             show_confirmation_dialog: false,
             show_edit_sources: false,
             show_edit_allowed_hosts: false,
+            show_edit_redirect_hosts: false,
             allowed_to_close: false,
             first_run: true,
             dialog_error_body: String::new(),
@@ -115,9 +124,10 @@ impl eframe::App for MyApp {
             ui.heading("Statistics");
             ui.horizontal(|ui| {
                 ui.label(format!("Blocked hosts: {}", self.blocked_hosts.len()));
-                if ui.button("Edit").clicked() {
-                    println!("TODO");
-                }
+                // I don't want to implement this so okay :)
+                // if ui.button("Edit").clicked() {
+                //     println!("TODO");
+                // }
             });
             ui.horizontal(|ui| {
                 ui.label(format!("Allowed hosts: {}", self.allowed_hosts.len()));
@@ -128,7 +138,7 @@ impl eframe::App for MyApp {
             ui.horizontal(|ui| {
                 ui.label(format!("Redirected hosts: {}", self.redirected_hosts.len()));
                 if ui.button("Edit").clicked() {
-                    println!("TODO");
+                    self.show_edit_redirect_hosts = true;
                 }
             });
             ui.label(format!(
@@ -297,6 +307,24 @@ impl eframe::App for MyApp {
                     };
                 self.allowed_hosts = allowed_hosts;
             }
+            let redirected_hosts_path = config_dir.join("redirected_hosts.json");
+            if redirected_hosts_path.exists() {
+                println!("Redirected hosts file exists, loading...");
+                let redirected_hosts_file = fs::read_to_string(redirected_hosts_path).unwrap();
+                let redirected_hosts: Vec<RedirectedHost> =
+                    match serde_json::from_str(&redirected_hosts_file) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            println!("Failed to load redirected hosts file: {}", e);
+                            show_modal(
+                                "Error".to_string(),
+                                format!("Failed to load redirected hosts file: {}", e),
+                            );
+                            vec![]
+                        }
+                    };
+                self.redirected_hosts = redirected_hosts;
+            }
             self.first_run = false;
         }
         if self.show_edit_allowed_hosts {
@@ -304,6 +332,7 @@ impl eframe::App for MyApp {
                 .collapsible(false)
                 .resizable(true)
                 .show(ctx, |ui| {
+                    ui.label("Allowed hosts are used to allow a host to be accessed.");
                     ui.horizontal(|ui| {
                         if ui.button("Add").clicked() {
                             self.allowed_hosts.push(AllowedHost {
@@ -362,7 +391,80 @@ impl eframe::App for MyApp {
                             ui.text_edit_singleline(&mut self.allowed_hosts[i].host);
                             if ui.button("X").clicked() {
                                 println!("Removing index: {}", i);
-                                self.hosts_sources.remove(i);
+                                self.allowed_hosts.remove(i);
+                            }
+                        });
+                    }
+                });
+        }
+        if self.show_edit_redirect_hosts {
+            egui::Window::new("Redirected hosts")
+                .collapsible(false)
+                .resizable(true)
+                .show(ctx, |ui| {
+                    ui.label("Redirected hosts are used to redirect a host to a specific IP address.");
+                    ui.label("The left column is the host, and the right column is the IP address.");
+                    ui.horizontal(|ui| {
+                        if ui.button("Add").clicked() {
+                            self.redirected_hosts.push(RedirectedHost {
+                                host: String::new(),
+                                ip: String::new(),
+                                enabled: true,
+                            });
+                        }
+                        if ui.button("Save & Close").clicked() {
+                            // Check if there is conflicting sources
+                            // If there is, show a dialog
+                            let mut urls: Vec<String> = vec![];
+                            for sources in self.redirected_hosts.iter() {
+                                if sources.host.is_empty() {
+                                    host_url_empty_modal.open();
+                                    return;
+                                }
+                                if urls.contains(&sources.host) {
+                                    // Show a dialog
+                                    conflict_hosts_modal.open();
+                                    return;
+                                }
+                                urls.push(sources.host.clone());
+                            }
+                            // Actually save the sources
+                            let config_dir = PROJECT_DIRS.config_dir();
+                            let hosts_sources_path = config_dir.join("redirected_hosts.json");
+                            match fs::write(
+                                hosts_sources_path,
+                                serde_json::to_string(&self.redirected_hosts).unwrap(),
+                            ) {
+                                Ok(_) => {
+                                    println!("Saved redirected hosts");
+                                }
+                                Err(e) => {
+                                    println!("Failed to save redirected hosts: {}", e);
+                                    show_modal(
+                                        "Error".to_string(),
+                                        format!("Failed to save redirected hosts: {}", e),
+                                    );
+                                    return;
+                                }
+                            }
+                            self.show_edit_redirect_hosts = false;
+                        }
+                    });
+                    // Create a list of sources so we can modify them ourselves :)
+                    let redirected_hosts = self.redirected_hosts.clone();
+                    for (i, _) in redirected_hosts.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            // Stop if we reach the end of the list
+                            // Otherwise it'll panic lol
+                            if i == self.redirected_hosts.len() {
+                                return;
+                            }
+                            ui.checkbox(&mut self.redirected_hosts[i].enabled, "");
+                            ui.text_edit_singleline(&mut self.redirected_hosts[i].host);
+                            ui.text_edit_singleline(&mut self.redirected_hosts[i].ip);
+                            if ui.button("X").clicked() {
+                                println!("Removing index: {}", i);
+                                self.redirected_hosts.remove(i);
                             }
                         });
                     }
