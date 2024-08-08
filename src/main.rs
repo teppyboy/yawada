@@ -1,8 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
+use blake3;
 use chrono::prelude::*;
 use directories::{self, ProjectDirs};
 use eframe::egui;
 use egui_modal::Modal;
+use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -16,9 +18,14 @@ static PROJECT_DIRS: LazyLock<ProjectDirs> = LazyLock::new(|| {
     proj_dirs
 });
 
+static CLIENT: LazyLock<Client> = LazyLock::new(|| {
+    let client = Client::new();
+    client
+});
+
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([460.0, 720.0]),
+        viewport: egui::ViewportBuilder::default().with_inner_size([640.0, 560.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -26,6 +33,12 @@ fn main() -> eframe::Result {
         options,
         Box::new(|_cc| Ok(Box::<MyApp>::default())),
     )
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct AllowedHost {
+    host: String,
+    enabled: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -37,13 +50,14 @@ struct HostsSource {
 
 struct MyApp {
     blocked_hosts: Vec<String>,
-    allowed_hosts: Vec<String>,
+    allowed_hosts: Vec<AllowedHost>,
     redirected_hosts: Vec<String>,
     is_hosts_file_installed: bool,
     hosts_sources: Vec<HostsSource>,
     hosts_sources_last_updated: u64,
     // UI parts
     show_edit_sources: bool,
+    show_edit_allowed_hosts: bool,
     show_confirmation_dialog: bool,
     allowed_to_close: bool,
     // HACK
@@ -63,6 +77,7 @@ impl Default for MyApp {
             hosts_sources_last_updated: 0,
             show_confirmation_dialog: false,
             show_edit_sources: false,
+            show_edit_allowed_hosts: false,
             allowed_to_close: false,
             first_run: true,
             dialog_error_body: String::new(),
@@ -73,6 +88,21 @@ impl Default for MyApp {
 
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Generic modal
+        let modal = Modal::new(ctx, "generic_modal");
+        modal.show(|ui| {
+            modal.title(ui, self.dialog_error_title.clone());
+            modal.body(ui, self.dialog_error_body.clone());
+            modal.buttons(ui, |ui| {
+                // After clicking, the modal is automatically closed
+                modal.button(ui, "OK").clicked();
+            });
+        });
+        let mut show_modal = |title: String, body: String| {
+            self.dialog_error_title = title;
+            self.dialog_error_body = body;
+            modal.open();
+        };
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.menu_button("Menu", |ui| {
                 if ui.button("Settings").clicked() {
@@ -92,7 +122,7 @@ impl eframe::App for MyApp {
             ui.horizontal(|ui| {
                 ui.label(format!("Allowed hosts: {}", self.allowed_hosts.len()));
                 if ui.button("Edit").clicked() {
-                    println!("TODO");
+                    self.show_edit_allowed_hosts = true;
                 }
             });
             ui.horizontal(|ui| {
@@ -106,7 +136,7 @@ impl eframe::App for MyApp {
                 self.is_hosts_file_installed
             ));
             ui.horizontal(|ui| {
-                if ui.button("Install").clicked() {
+                if ui.button("Install/Update").clicked() {
                     println!("TODO");
                 }
                 if ui.button("Uninstall").clicked() {
@@ -132,7 +162,46 @@ impl eframe::App for MyApp {
             ));
             ui.horizontal(|ui| {
                 if ui.button("Update").clicked() {
-                    println!("TODO");
+                    for (i, source) in self.hosts_sources.clone().into_iter().enumerate() {
+                        // Actually update the source
+                        match CLIENT.get(source.url.clone()).send() {
+                            Ok(response) => {
+                                let body = response.text().unwrap();
+                                let file_name =
+                                    blake3::hash(source.url.as_bytes()).to_hex().to_string();
+                                let config_dir = PROJECT_DIRS.config_dir();
+                                let hosts_sources_path =
+                                    config_dir.join("hosts_sources").join(file_name);
+                                match fs::write(&hosts_sources_path, body) {
+                                    Ok(_) => {
+                                        println!("Fetched hosts source for index: {}", i);
+                                        let current_time = SystemTime::now()
+                                            .duration_since(UNIX_EPOCH)
+                                            .unwrap()
+                                            .as_secs();
+                                        self.hosts_sources[i].last_updated = current_time;
+                                        self.hosts_sources_last_updated = current_time;
+                                    }
+                                    Err(e) => {
+                                        println!("Failed to fetch hosts source: {}", e);
+                                        show_modal(
+                                            "Error".to_string(),
+                                            format!("Failed to fetch hosts source: {}", e),
+                                        );
+                                        return;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                println!("Failed to fetch hosts source: {}", e);
+                                show_modal(
+                                    "Error".to_string(),
+                                    format!("Failed to fetch hosts source: {}", e),
+                                );
+                                return;
+                            }
+                        }
+                    }
                 }
                 if ui.button("Edit sources").clicked() {
                     self.show_edit_sources = true;
@@ -140,21 +209,6 @@ impl eframe::App for MyApp {
             });
         });
         // Modals
-        // Generic modal
-        let modal = Modal::new(ctx, "generic_modal");
-        modal.show(|ui| {
-            modal.title(ui, self.dialog_error_title.clone());
-            modal.body(ui, self.dialog_error_body.clone());
-            modal.buttons(ui, |ui| {
-                // After clicking, the modal is automatically closed
-                modal.button(ui, "OK").clicked();
-            });
-        });
-        let mut show_modal = |title: String, body: String| {
-            self.dialog_error_title = title;
-            self.dialog_error_body = body;
-            modal.open();
-        };
         // Conflict modal
         let conflict_hosts_modal = Modal::new(ctx, "conflict_hosts_modal");
         conflict_hosts_modal.show(|ui| {
@@ -196,6 +250,7 @@ impl eframe::App for MyApp {
                 close_confirmation_modal.open();
             }
         }
+        // First run of the loop
         if self.first_run {
             // Load the hosts sources
             let config_dir = PROJECT_DIRS.config_dir();
@@ -207,20 +262,111 @@ impl eframe::App for MyApp {
             if hosts_sources_path.exists() {
                 println!("Hosts sources file exists, loading...");
                 let hosts_sources_file = fs::read_to_string(hosts_sources_path).unwrap();
-                let hosts_sources: Vec<HostsSource> = match serde_json::from_str(&hosts_sources_file) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        println!("Failed to load hosts sources file: {}", e);
-                        show_modal("Error".to_string(), format!("Failed to load hosts sources file: {}", e));
-                        vec![]
-                    }
-                };
+                let hosts_sources: Vec<HostsSource> =
+                    match serde_json::from_str(&hosts_sources_file) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            println!("Failed to load hosts sources file: {}", e);
+                            show_modal(
+                                "Error".to_string(),
+                                format!("Failed to load hosts sources file: {}", e),
+                            );
+                            vec![]
+                        }
+                    };
                 self.hosts_sources = hosts_sources;
                 if self.hosts_sources.len() > 0 {
                     self.hosts_sources_last_updated = self.hosts_sources[0].last_updated;
                 }
             }
+            let allowed_hosts_path = config_dir.join("allowed_hosts.json");
+            if allowed_hosts_path.exists() {
+                println!("Allowed hosts file exists, loading...");
+                let allowed_hosts_file = fs::read_to_string(allowed_hosts_path).unwrap();
+                let allowed_hosts: Vec<AllowedHost> =
+                    match serde_json::from_str(&allowed_hosts_file) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            println!("Failed to load alllowed hosts file: {}", e);
+                            show_modal(
+                                "Error".to_string(),
+                                format!("Failed to load allowed hosts file: {}", e),
+                            );
+                            vec![]
+                        }
+                    };
+                self.allowed_hosts = allowed_hosts;
+            }
             self.first_run = false;
+        }
+        if self.show_edit_allowed_hosts {
+            egui::Window::new("Allowed hosts")
+                .collapsible(false)
+                .resizable(true)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.button("Add").clicked() {
+                            self.allowed_hosts.push(AllowedHost {
+                                host: String::new(),
+                                enabled: true,
+                            });
+                        }
+                        if ui.button("Save & Close").clicked() {
+                            // Check if there is conflicting sources
+                            // If there is, show a dialog
+                            let mut urls: Vec<String> = vec![];
+                            for sources in self.allowed_hosts.iter() {
+                                if sources.host.is_empty() {
+                                    host_url_empty_modal.open();
+                                    return;
+                                }
+                                if urls.contains(&sources.host) {
+                                    // Show a dialog
+                                    conflict_hosts_modal.open();
+                                    return;
+                                }
+                                urls.push(sources.host.clone());
+                            }
+                            // Actually save the sources
+                            let config_dir = PROJECT_DIRS.config_dir();
+                            let hosts_sources_path = config_dir.join("allowed_hosts.json");
+                            match fs::write(
+                                hosts_sources_path,
+                                serde_json::to_string(&self.allowed_hosts).unwrap(),
+                            ) {
+                                Ok(_) => {
+                                    println!("Saved allowed hosts");
+                                }
+                                Err(e) => {
+                                    println!("Failed to save allowed hosts: {}", e);
+                                    show_modal(
+                                        "Error".to_string(),
+                                        format!("Failed to save allowed hosts: {}", e),
+                                    );
+                                    return;
+                                }
+                            }
+                            self.show_edit_allowed_hosts = false;
+                        }
+                    });
+                    // Create a list of sources so we can modify them ourselves :)
+                    let allowed_hosts = self.allowed_hosts.clone();
+                    for (i, _) in allowed_hosts.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            // Stop if we reach the end of the list
+                            // Otherwise it'll panic lol
+                            if i == self.allowed_hosts.len() {
+                                return;
+                            }
+                            ui.checkbox(&mut self.allowed_hosts[i].enabled, "");
+                            ui.text_edit_singleline(&mut self.allowed_hosts[i].host);
+                            if ui.button("X").clicked() {
+                                println!("Removing index: {}", i);
+                                self.hosts_sources.remove(i);
+                            }
+                        });
+                    }
+                });
         }
         if self.show_edit_sources {
             egui::Window::new("Hosts sources")
@@ -235,7 +381,7 @@ impl eframe::App for MyApp {
                                 enabled: true,
                             });
                         }
-                        if ui.button("Close").clicked() {
+                        if ui.button("Save & Close").clicked() {
                             // Check if there is conflicting sources
                             // If there is, show a dialog
                             let mut urls: Vec<String> = vec![];
@@ -254,13 +400,19 @@ impl eframe::App for MyApp {
                             // Actually save the sources
                             let config_dir = PROJECT_DIRS.config_dir();
                             let hosts_sources_path = config_dir.join("hosts_sources.json");
-                            match fs::write(hosts_sources_path, serde_json::to_string(&self.hosts_sources).unwrap()) {
+                            match fs::write(
+                                hosts_sources_path,
+                                serde_json::to_string(&self.hosts_sources).unwrap(),
+                            ) {
                                 Ok(_) => {
                                     println!("Saved hosts sources");
                                 }
                                 Err(e) => {
                                     println!("Failed to save hosts sources: {}", e);
-                                    show_modal("Error".to_string(), format!("Failed to save hosts sources: {}", e));
+                                    show_modal(
+                                        "Error".to_string(),
+                                        format!("Failed to save hosts sources: {}", e),
+                                    );
                                     return;
                                 }
                             }
@@ -291,8 +443,9 @@ impl eframe::App for MyApp {
                                     datetime.format("%Y-%m-%d %H:%M:%S").to_string()
                                 }
                             ));
-                            if ui.button("Update").clicked() {
-                                // Check if there is conflicting sources    
+                            let update_btn = ui.button("Update");
+                            if update_btn.clicked() {
+                                // Check if there is conflicting sources
                                 // If there is, show a dialog
                                 if self.hosts_sources[i].url.is_empty() {
                                     host_url_empty_modal.open();
@@ -308,7 +461,39 @@ impl eframe::App for MyApp {
                                     urls.push(sources.url.clone());
                                 }
                                 // Actually update the source
-                                println!("TODO");
+                                match CLIENT.get(&self.hosts_sources[i].url).send() {
+                                    Ok(response) => {
+                                        let body = response.text().unwrap();
+                                        let file_name =
+                                            blake3::hash(&self.hosts_sources[i].url.as_bytes())
+                                                .to_hex()
+                                                .to_string();
+                                        let config_dir = PROJECT_DIRS.config_dir();
+                                        let hosts_sources_path =
+                                            config_dir.join("hosts_sources").join(file_name);
+                                        match fs::write(&hosts_sources_path, body) {
+                                            Ok(_) => {
+                                                println!("Fetched hosts source");
+                                            }
+                                            Err(e) => {
+                                                println!("Failed to fetch hosts source: {}", e);
+                                                show_modal(
+                                                    "Error".to_string(),
+                                                    format!("Failed to fetch hosts source: {}", e),
+                                                );
+                                                return;
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        println!("Failed to fetch hosts source: {}", e);
+                                        show_modal(
+                                            "Error".to_string(),
+                                            format!("Failed to fetch hosts source: {}", e),
+                                        );
+                                        return;
+                                    }
+                                }
                                 let current_time = SystemTime::now()
                                     .duration_since(UNIX_EPOCH)
                                     .unwrap()
